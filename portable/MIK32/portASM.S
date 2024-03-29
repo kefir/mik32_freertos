@@ -1,62 +1,3 @@
-/*
- * FreeRTOS Kernel V11.0.1
- * Copyright (C) 2021 Amazon.com, Inc. or its affiliates.  All Rights Reserved.
- *
- * SPDX-License-Identifier: MIT
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy of
- * this software and associated documentation files (the "Software"), to deal in
- * the Software without restriction, including without limitation the rights to
- * use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
- * the Software, and to permit persons to whom the Software is furnished to do so,
- * subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
- * FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
- * COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
- * IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
- * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
- *
- * https://www.FreeRTOS.org
- * https://github.com/FreeRTOS
- *
- */
-
-/*
- * The FreeRTOS kernel's RISC-V port is split between the the code that is
- * common across all currently supported RISC-V chips (implementations of the
- * RISC-V ISA), and code which tailors the port to a specific RISC-V chip:
- *
- * + The code that is common to all RISC-V chips is implemented in
- *   FreeRTOS\Source\portable\GCC\RISC-V-RV32\portASM.S.  There is only one
- *   portASM.S file because the same file is used no matter which RISC-V chip is
- *   in use.
- *
- * + The code that tailors the kernel's RISC-V port to a specific RISC-V
- *   chip is implemented in freertos_risc_v_chip_specific_extensions.h.  There
- *   is one freertos_risc_v_chip_specific_extensions.h that can be used with any
- *   RISC-V chip that both includes a standard CLINT and does not add to the
- *   base set of RISC-V registers.  There are additional
- *   freertos_risc_v_chip_specific_extensions.h files for RISC-V implementations
- *   that do not include a standard CLINT or do add to the base set of RISC-V
- *   registers.
- *
- * CARE MUST BE TAKEN TO INCLDUE THE CORRECT
- * freertos_risc_v_chip_specific_extensions.h HEADER FILE FOR THE CHIP
- * IN USE.  To include the correct freertos_risc_v_chip_specific_extensions.h
- * header file ensure the path to the correct header file is in the assembler's
- * include path.
- *
- * This freertos_risc_v_chip_specific_extensions.h is for use on RISC-V chips
- * that include a standard CLINT and do not add to the base set of RISC-V
- * registers.
- *
- */
-
 #include "portContext.h"
 
 /* Check the freertos_risc_v_chip_specific_extensions.h and/or command line
@@ -82,54 +23,13 @@ definitions. */
 .global xPortStartFirstTask
 .global pxPortInitialiseStack
 .global freertos_risc_v_trap_handler
-.global freertos_risc_v_exception_handler
-.global freertos_risc_v_interrupt_handler
-.global freertos_risc_v_mtimer_interrupt_handler
 
 .extern vTaskSwitchContext
-.extern xTaskIncrementTick
-.extern pullMachineTimerCompareRegister
-.extern pullNextTime
-.extern uxTimerIncrementsForOneTick /* size_t type so 32-bit on 32-bit core and 64-bits on 64-bit core. */
 .extern xTaskReturnAddress
+.extern xCriticalNesting
 
 .weak freertos_risc_v_application_exception_handler
 .weak freertos_risc_v_application_interrupt_handler
-/*-----------------------------------------------------------*/
-
-.macro portUPDATE_MTIMER_COMPARE_REGISTER
-    load_x a0, pullMachineTimerCompareRegister  /* Load address of compare register into a0. */
-    load_x a1, pullNextTime                     /* Load the address of ullNextTime into a1. */
-
-    #if( __riscv_xlen == 32 )
-
-        /* Update the 64-bit mtimer compare match value in two 32-bit writes. */
-        li a4, -1
-        lw a2, 0(a1)                /* Load the low word of ullNextTime into a2. */
-        lw a3, 4(a1)                /* Load the high word of ullNextTime into a3. */
-        sw a4, 0(a0)                /* Low word no smaller than old value to start with - will be overwritten below. */
-        sw a3, 4(a0)                /* Store high word of ullNextTime into compare register.  No smaller than new value. */
-        sw a2, 0(a0)                /* Store low word of ullNextTime into compare register. */
-        lw t0, uxTimerIncrementsForOneTick  /* Load the value of ullTimerIncrementForOneTick into t0 (could this be optimized by storing in an array next to pullNextTime?). */
-        add a4, t0, a2              /* Add the low word of ullNextTime to the timer increments for one tick (assumes timer increment for one tick fits in 32-bits). */
-        sltu t1, a4, a2             /* See if the sum of low words overflowed (what about the zero case?). */
-        add t2, a3, t1              /* Add overflow to high word of ullNextTime. */
-        sw a4, 0(a1)                /* Store new low word of ullNextTime. */
-        sw t2, 4(a1)                /* Store new high word of ullNextTime. */
-
-    #endif /* __riscv_xlen == 32 */
-
-    #if( __riscv_xlen == 64 )
-
-        /* Update the 64-bit mtimer compare match value. */
-        ld t2, 0(a1)                /* Load ullNextTime into t2. */
-        sd t2, 0(a0)                /* Store ullNextTime into compare register. */
-        ld t0, uxTimerIncrementsForOneTick  /* Load the value of ullTimerIncrementForOneTick into t0 (could this be optimized by storing in an array next to pullNextTime?). */
-        add t4, t0, t2              /* Add ullNextTime to the timer increments for one tick. */
-        sd t4, 0(a1)                /* Store ullNextTime. */
-
-    #endif /* __riscv_xlen == 64 */
-    .endm
 /*-----------------------------------------------------------*/
 
 /*
@@ -195,6 +95,47 @@ definitions. */
  * [chip specific registers go here]
  * pxCode
  */
+
+.section .text.freertos_risc_v_trap_handler,"ax",@progbits
+freertos_risc_v_trap_handler:
+    portcontextSAVE_CONTEXT_INTERNAL
+
+    csrr a0, mcause
+    csrr a1, mepc
+
+    bge a0, x0, synchronous_exception
+
+asynchronous_interrupt:
+    store_x a1, 0( sp )                 /* Asynchronous interrupt so save unmodified exception return address. */
+    load_x sp, xISRStackTop             /* Switch to ISR stack. */
+    j handle_interrupt
+
+synchronous_exception:
+    addi a1, a1, 4                      /* Synchronous so update exception return address to the instruction after the instruction that generated the exeption. */
+    store_x a1, 0( sp )                 /* Save updated exception return address. */
+    load_x sp, xISRStackTop             /* Switch to ISR stack. */
+    j handle_exception
+
+handle_interrupt:
+
+application_interrupt_handler:
+    call freertos_risc_v_application_interrupt_handler
+    j processed_source
+
+handle_exception:
+    /* a0 contains mcause. */
+    li t0, 11                                   /* 11 == environment call. */
+    bne a0, t0, application_exception_handler   /* Not an M environment call, so some other exception. */
+    call vTaskSwitchContext
+    j processed_source
+
+application_exception_handler:
+    call freertos_risc_v_application_exception_handler
+    j processed_source                  /* No other exceptions handled yet. */
+
+processed_source:
+    portcontextRESTORE_CONTEXT
+
 pxPortInitialiseStack:
     csrr t0, mstatus                    /* Obtain current mstatus value. */
     andi t0, t0, ~0x8                   /* Ensure interrupts are disabled when the stack is restored within an ISR.  Required when a task is created after the schedulre has been started, otherwise interrupts would be disabled anyway. */
@@ -292,93 +233,4 @@ freertos_risc_v_application_interrupt_handler:
     csrr t1, mepc       /* For viewing in the debugger only */
     csrr t2, mstatus    /* For viewing in the debugger only */
     j .
-/*-----------------------------------------------------------*/
-
-.section .text.freertos_risc_v_exception_handler
-freertos_risc_v_exception_handler:
-    portcontextSAVE_EXCEPTION_CONTEXT
-    /* a0 now contains mcause. */
-    li t0, 11                           /* 11 == environment call. */
-    bne a0, t0, other_exception         /* Not an M environment call, so some other exception. */
-    call vTaskSwitchContext
-    portcontextRESTORE_CONTEXT
-
-other_exception:
-    call freertos_risc_v_application_exception_handler
-    portcontextRESTORE_CONTEXT
-/*-----------------------------------------------------------*/
-
-.section .text.freertos_risc_v_interrupt_handler
-freertos_risc_v_interrupt_handler:
-    portcontextSAVE_INTERRUPT_CONTEXT
-    call freertos_risc_v_application_interrupt_handler
-    portcontextRESTORE_CONTEXT
-/*-----------------------------------------------------------*/
-
-.section .text.freertos_risc_v_mtimer_interrupt_handler
-freertos_risc_v_mtimer_interrupt_handler:
-    portcontextSAVE_INTERRUPT_CONTEXT
-    portUPDATE_MTIMER_COMPARE_REGISTER
-    call xTaskIncrementTick
-    beqz a0, exit_without_context_switch    /* Don't switch context if incrementing tick didn't unblock a task. */
-    call vTaskSwitchContext
-exit_without_context_switch:
-    portcontextRESTORE_CONTEXT
-/*-----------------------------------------------------------*/
-
-.section .text.freertos_risc_v_trap_handler
-.align 8
-freertos_risc_v_trap_handler:
-    portcontextSAVE_CONTEXT_INTERNAL
-
-    csrr a0, mcause
-    csrr a1, mepc
-
-    bge a0, x0, synchronous_exception
-
-asynchronous_interrupt:
-    store_x a1, 0( sp )                 /* Asynchronous interrupt so save unmodified exception return address. */
-    load_x sp, xISRStackTop             /* Switch to ISR stack. */
-    j handle_interrupt
-
-synchronous_exception:
-    addi a1, a1, 4                      /* Synchronous so update exception return address to the instruction after the instruction that generated the exeption. */
-    store_x a1, 0( sp )                 /* Save updated exception return address. */
-    load_x sp, xISRStackTop             /* Switch to ISR stack. */
-    j handle_exception
-
-handle_interrupt:
-#if( portasmHAS_MTIME != 0 )
-
-    test_if_mtimer:                     /* If there is a CLINT then the mtimer is used to generate the tick interrupt. */
-        addi t0, x0, 1
-        slli t0, t0, __riscv_xlen - 1   /* LSB is already set, shift into MSB.  Shift 31 on 32-bit or 63 on 64-bit cores. */
-        addi t1, t0, 7                  /* 0x8000[]0007 == machine timer interrupt. */
-        bne a0, t1, application_interrupt_handler
-
-        portUPDATE_MTIMER_COMPARE_REGISTER
-        call xTaskIncrementTick
-        beqz a0, processed_source       /* Don't switch context if incrementing tick didn't unblock a task. */
-        call vTaskSwitchContext
-        j processed_source
-
-#endif /* portasmHAS_MTIME */
-
-application_interrupt_handler:
-    call freertos_risc_v_application_interrupt_handler
-    j processed_source
-
-handle_exception:
-    /* a0 contains mcause. */
-    li t0, 11                                   /* 11 == environment call. */
-    bne a0, t0, application_exception_handler   /* Not an M environment call, so some other exception. */
-    call vTaskSwitchContext
-    j processed_source
-
-application_exception_handler:
-    call freertos_risc_v_application_exception_handler
-    j processed_source                  /* No other exceptions handled yet. */
-
-processed_source:
-    portcontextRESTORE_CONTEXT
 /*-----------------------------------------------------------*/

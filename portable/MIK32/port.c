@@ -35,6 +35,10 @@
 #include "task.h"
 #include "portmacro.h"
 
+#include "mcu32_memory_map.h"
+#include "scr1_timer.h"
+#include "target.h"
+
 /* Standard includes. */
 #include "string.h"
 
@@ -84,15 +88,6 @@ const StackType_t xISRStackTop = ( StackType_t ) &( xISRStack[ configISR_STACK_S
  */
 void vPortSetupTimerInterrupt( void ) __attribute__( ( weak ) );
 
-/*-----------------------------------------------------------*/
-
-/* Used to program the machine timer compare register. */
-uint64_t ullNextTime = 0ULL;
-const uint64_t * pullNextTime = &ullNextTime;
-const size_t uxTimerIncrementsForOneTick = ( size_t ) ( ( configCPU_CLOCK_HZ ) / ( configTICK_RATE_HZ ) ); /* Assumes increment won't go over 32-bits. */
-uint32_t const ullMachineTimerCompareRegisterBase = configMTIMECMP_BASE_ADDRESS;
-volatile uint64_t * pullMachineTimerCompareRegister = NULL;
-
 /* Holds the critical nesting value - deliberately non-zero at start up to
  * ensure interrupts are not accidentally enabled before the scheduler starts. */
 size_t xCriticalNesting = ( size_t ) 0xaaaaaaaa;
@@ -123,39 +118,10 @@ size_t xTaskReturnAddress = ( size_t ) portTASK_RETURN_ADDRESS;
     #define portCHECK_ISR_STACK()
 #endif /* configCHECK_FOR_STACK_OVERFLOW > 2 */
 
-/*-----------------------------------------------------------*/
-
-#if ( configMTIME_BASE_ADDRESS != 0 ) && ( configMTIMECMP_BASE_ADDRESS != 0 )
-
-    void vPortSetupTimerInterrupt( void )
-    {
-        uint32_t ulCurrentTimeHigh, ulCurrentTimeLow;
-        volatile uint32_t * const pulTimeHigh = ( volatile uint32_t * const ) ( ( configMTIME_BASE_ADDRESS ) + 4UL ); /* 8-byte type so high 32-bit word is 4 bytes up. */
-        volatile uint32_t * const pulTimeLow = ( volatile uint32_t * const ) ( configMTIME_BASE_ADDRESS );
-        volatile uint32_t ulHartId;
-
-        __asm volatile ( "csrr %0, mhartid" : "=r" ( ulHartId ) );
-
-        pullMachineTimerCompareRegister = ( volatile uint64_t * ) ( ullMachineTimerCompareRegisterBase + ( ulHartId * sizeof( uint64_t ) ) );
-
-        do
-        {
-            ulCurrentTimeHigh = *pulTimeHigh;
-            ulCurrentTimeLow = *pulTimeLow;
-        } while( ulCurrentTimeHigh != *pulTimeHigh );
-
-        ullNextTime = ( uint64_t ) ulCurrentTimeHigh;
-        ullNextTime <<= 32ULL; /* High 4-byte word is 32-bits up. */
-        ullNextTime |= ( uint64_t ) ulCurrentTimeLow;
-        ullNextTime += ( uint64_t ) uxTimerIncrementsForOneTick;
-        *pullMachineTimerCompareRegister = ullNextTime;
-
-        /* Prepare the time to use after the next tick interrupt. */
-        ullNextTime += ( uint64_t ) uxTimerIncrementsForOneTick;
-    }
-
-#endif /* ( configMTIME_BASE_ADDRESS != 0 ) && ( configMTIME_BASE_ADDRESS != 0 ) */
-/*-----------------------------------------------------------*/
+void vPortSetupTimerInterrupt(void)
+{
+    target_system_timer_init();
+}
 
 BaseType_t xPortStartScheduler( void )
 {
@@ -167,36 +133,14 @@ BaseType_t xPortStartScheduler( void )
          * stack that was being used by main() prior to the scheduler being
          * started. */
         configASSERT( ( xISRStackTop & portBYTE_ALIGNMENT_MASK ) == 0 );
-
-        #ifdef configISR_STACK_SIZE_WORDS
-        {
-            memset( ( void * ) xISRStack, portISR_STACK_FILL_BYTE, sizeof( xISRStack ) );
-        }
-        #endif /* configISR_STACK_SIZE_WORDS */
     }
     #endif /* configASSERT_DEFINED */
 
-    /* If there is a CLINT then it is ok to use the default implementation
-     * in this file, otherwise vPortSetupTimerInterrupt() must be implemented to
-     * configure whichever clock is to be used to generate the tick interrupt. */
     vPortSetupTimerInterrupt();
-
-    #if ( ( configMTIME_BASE_ADDRESS != 0 ) && ( configMTIMECMP_BASE_ADDRESS != 0 ) )
-    {
-        /* Enable mtime and external interrupts.  1<<7 for timer interrupt,
-         * 1<<11 for external interrupt.  _RB_ What happens here when mtime is
-         * not present as with pulpino? */
-        __asm volatile ( "csrs mie, %0" ::"r" ( 0x880 ) );
-    }
-    #endif /* ( configMTIME_BASE_ADDRESS != 0 ) && ( configMTIMECMP_BASE_ADDRESS != 0 ) */
-
     xPortStartFirstTask();
 
-    /* Should not get here as after calling xPortStartFirstTask() only tasks
-     * should be executing. */
     return pdFAIL;
 }
-/*-----------------------------------------------------------*/
 
 void vPortEndScheduler( void )
 {
@@ -205,4 +149,11 @@ void vPortEndScheduler( void )
     {
     }
 }
-/*-----------------------------------------------------------*/
+
+void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName)
+{
+    UNUSED(xTask);
+    UNUSED(pcTaskName);
+    for (;;) {
+    }
+}
